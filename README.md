@@ -110,6 +110,7 @@ func main() {
 			SlotActivityCheckerInterval: 3000,
 			ProtoVersion:                2,
 		},
+		BoundaryMessages: true,
 		Metric: config.MetricConfig{
 			Port: 8081,
 		},
@@ -138,6 +139,8 @@ func Handler(ctx *replication.ListenerContext) {
 		slog.Info("update message received", "new", msg.NewDecoded, "old", msg.OldDecoded)
 	case *format.Truncate:
 		slog.Info("truncate message received", "relations", msg.RelationOIDs, "cascade", msg.Cascade, "restartIdentity", msg.RestartIdentity)
+	case *format.Begin, *format.Commit, *format.StreamCommit:
+		return
 	}
 
 	if err := ctx.Ack(); err != nil {
@@ -146,6 +149,8 @@ func Handler(ctx *replication.ListenerContext) {
 }
 
 ```
+
+`Begin`, `Commit`, and `StreamCommit` are delivered to `Handler` when `boundaryMessages` is true. The default is false. When enabled, `Begin` arrives before that transaction's changes, and `Commit` and `StreamCommit` arrive after them. Leave these messages unacked. The slot advances when a row event is acked: the last change in the transaction is positioned at the transaction-end LSN, and that ack moves the slot past the commit. An ack of `Commit` or `StreamCommit` confirms only the start of the commit record and can mark the preceding row changes consumed. `StreamAbort` is not delivered. A rolled-back transaction never reaches the listener.
 
 ### Examples
 
@@ -363,6 +368,7 @@ You can run [Replica Identity Nothing](./example/replica-identity-nothing) for a
 | `password`                              |  string  |   yes    |    -    | PostgreSQL password                                                                                   | Keep secure and avoid hardcoding in the source code.                                                                                               |
 | `database`                              |  string  |   yes    |    -    | PostgreSQL database                                                                                   | The database must exist and be accessible by the specified user.                                                                                   |
 | `debugMode`                             |   bool   |    no    |  false  | For debugging purposes                                                                                | Enables pprof for trace.                                                                                                                           |
+| `boundaryMessages`                      |   bool   |    no    |  false  | Deliver `Begin`, `Commit`, and `StreamCommit` to the handler                                          | Leave these messages unacked. Slot progress comes from acknowledging row events.                                                                  |
 | `metric.port`                           |   int    |    no    |  8080   | Set API port                                                                                          | Choose a port that is not in use by other applications.                                                                                            |
 | `logger.logLevel`                       |  string  |    no    |  info   | Set logging level                                                                                     | [`DEBUG`, `WARN`, `INFO`, `ERROR`]                                                                                                                 |
 | `logger.logger`                         |  Logger  |    no    |  slog   | Set logger                                                                                            | Can be customized with other logging frameworks if `slog` is not used.                                                                             |
