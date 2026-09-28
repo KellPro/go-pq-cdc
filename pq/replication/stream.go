@@ -567,15 +567,38 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 // emitted to the consumer on STREAM COMMIT and discarded on STREAM ABORT
 // (whole transaction or, for a sub-transaction abort, only its own changes).
 // This prevents uncommitted data from being delivered.
+//
+// Begin, Commit, and StreamCommit are delivered to the listener after that
+// bookkeeping, in stream order, when BoundaryMessages is set.
+// StreamAbort is not: a rolled-back transaction is never delivered.
 func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffer, streamBuf *streamTxBuffer) {
 	switch msg := decodedMsg.(type) {
 	case *format.Begin:
 		buf.discard()
 		buf.xid = msg.Xid
 		buf.commitLSN = msg.FinalLSN
+		if s.config.BoundaryMessages {
+			buf.send(&Message{
+				message:   decodedMsg,
+				walStart:  int64(xld.WALStart),
+				xid:       msg.Xid,
+				commitLSN: msg.FinalLSN,
+			})
+		}
 
 	case *format.Commit:
 		buf.flushWithLSN(msg.TransactionEndLSN)
+		// Deliver Commit after the transaction's changes, with the xid and
+		// commit LSN recorded at Begin, so the listener sees the boundary
+		// when the transaction commits.
+		if s.config.BoundaryMessages {
+			buf.send(&Message{
+				message:   decodedMsg,
+				walStart:  int64(xld.WALStart),
+				xid:       buf.xid,
+				commitLSN: buf.commitLSN,
+			})
+		}
 
 	case *format.StreamStart:
 		// Beginning of a streaming chunk – DML events that follow belong
@@ -587,8 +610,17 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 		streamBuf.stopTx()
 
 	case *format.StreamCommit:
-		// Final commit of a streamed transaction – emit all messages for this XID.
+		// Final commit of a streamed transaction – emit all messages for this XID,
+		// then the commit itself so the boundary is not deferred to the next transaction.
 		streamBuf.flushTx(msg.Xid, buf.outCh, msg.CommitLSN, msg.TransactionEndLSN)
+		if s.config.BoundaryMessages {
+			buf.send(&Message{
+				message:   decodedMsg,
+				walStart:  int64(xld.WALStart),
+				xid:       msg.Xid,
+				commitLSN: msg.CommitLSN,
+			})
+		}
 
 	case *format.StreamAbort:
 		// Whole transaction (SubXid == Xid) or a single sub-transaction

@@ -30,7 +30,8 @@ type Config struct {
 	Port             int                   `json:"port" yaml:"port"`
 	Metric           MetricConfig          `json:"metric" yaml:"metric"`
 	DebugMode        bool                  `json:"debugMode" yaml:"debugMode"`
-	ExtensionSupport ExtensionSupport      `json:"extensionSupport" yaml:"extensionSupport"`
+	BoundaryMessages bool             `json:"boundaryMessages" yaml:"boundaryMessages"`
+	ExtensionSupport ExtensionSupport `json:"extensionSupport" yaml:"extensionSupport"`
 }
 
 // VisibilityGuardConfig holds the first message of every transaction until the

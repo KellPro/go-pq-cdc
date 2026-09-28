@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq/slot"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v2"
 )
 
 func TestGetSnapshotTables(t *testing.T) {
@@ -669,4 +671,18 @@ func TestVisibilityGuardConfig(t *testing.T) {
 		}
 		require.ErrorContains(t, cfg.Validate(), "visibilityGuard.failMode")
 	})
+}
+
+func TestBoundaryMessagesDefaultsOff(t *testing.T) {
+	var fromYAML Config
+	require.NoError(t, yaml.Unmarshal([]byte("host: localhost\nboundaryMessages: true\n"), &fromYAML))
+	assert.True(t, fromYAML.BoundaryMessages)
+
+	var omitted Config
+	require.NoError(t, yaml.Unmarshal([]byte("host: localhost\n"), &omitted))
+	assert.False(t, omitted.BoundaryMessages)
+
+	var fromJSON Config
+	require.NoError(t, json.Unmarshal([]byte(`{"boundaryMessages":true}`), &fromJSON))
+	assert.True(t, fromJSON.BoundaryMessages)
 }
