@@ -2,18 +2,19 @@ package replication
 
 import (
 	"context"
-	"log/slog"
-	"sync"
-	"testing"
-	"time"
 	"fmt"
 	"github.com/Trendyol/go-pq-cdc/config"
+	"github.com/Trendyol/go-pq-cdc/internal/metric"
 	"github.com/Trendyol/go-pq-cdc/logger"
 	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"log/slog"
+	"sync"
+	"testing"
+	"time"
 )
 
 // gatedStream wires a stream to a scripted guard and records what the listener saw.
@@ -153,12 +154,6 @@ func TestDispatchStampsXidAndCommitLSNOnNonStreamingAndStreamingPaths(t *testing
 		lsn    int64
 		commit pq.LSN
 	}
-	rows := []stamped{
-		{"*format.Insert", "a", 100, 2, 40},
-		{"*format.Insert", "b", 100, 50, 40},
-		{"*format.Insert", "c", 200, 6, 90},
-		{"*format.Insert", "d", 200, 99, 90},
-	}
 	dispatch := func(cfg config.Config) []stamped {
 		out := make(chan *Message, 10)
 		s := &stream{config: cfg}
@@ -166,8 +161,7 @@ func TestDispatchStampsXidAndCommitLSNOnNonStreamingAndStreamingPaths(t *testing
 		streamBuf := &streamTxBuffer{}
 		send := func(msg any, lsn uint64) { s.dispatchMessage(msg, XLogData{WALStart: pq.LSN(lsn)}, buf, streamBuf) }
 
-		// Non-streaming: BEGIN(100, final 40) a b COMMIT → both carry xid 100 and commit 40 (from Begin.FinalLSN);
-		// the last one is rebuilt by flushWithLSN.
+		// Non-streaming: BEGIN(100, final 40) a b COMMIT → both carry xid 100 and commit 40 (from Begin.FinalLSN).
 		send(&format.Begin{Xid: 100, FinalLSN: 40}, 1)
 		send(&format.Insert{TableName: "a"}, 2)
 		send(&format.Insert{TableName: "b"}, 3)
@@ -193,16 +187,55 @@ func TestDispatchStampsXidAndCommitLSNOnNonStreamingAndStreamingPaths(t *testing
 		return got
 	}
 
-	assert.Equal(t, rows, dispatch(config.Config{}), "transaction boundaries stay internal unless opted in")
+	// Flag off: the last change is rewritten to the transaction-end LSN, and the boundaries stay internal.
+	assert.Equal(t, []stamped{
+		{"*format.Insert", "a", 100, 2, 40},
+		{"*format.Insert", "b", 100, 50, 40},
+		{"*format.Insert", "c", 200, 6, 90},
+		{"*format.Insert", "d", 200, 99, 90},
+	}, dispatch(config.Config{}))
+	// Flag on: each row keeps its own WAL position. Begin keeps its own WAL
+	// position (1), not FinalLSN (40). Commit and StreamCommit carry the
+	// transaction-end LSN.
 	assert.Equal(t, []stamped{
 		{"*format.Begin", "", 100, 1, 40},
-		rows[0],
-		rows[1],
-		{"*format.Commit", "", 100, 4, 40},
-		rows[2],
-		rows[3],
-		{"*format.StreamCommit", "", 200, 9, 90},
+		{"*format.Insert", "a", 100, 2, 40},
+		{"*format.Insert", "b", 100, 3, 40},
+		{"*format.Commit", "", 100, 50, 40},
+		{"*format.Insert", "c", 200, 6, 90},
+		{"*format.Insert", "d", 200, 7, 90},
+		{"*format.StreamCommit", "", 200, 99, 90},
 	}, dispatch(config.Config{BoundaryMessages: true}))
+}
+
+func TestBeginAckIsOptionalAndConfirmsOwnPosition(t *testing.T) {
+	logger.InitLogger(logger.NewSlog(slog.LevelError))
+	begin := func() *Message {
+		return &Message{
+			message:   &format.Begin{Xid: 100, FinalLSN: 40},
+			walStart:  1,
+			xid:       100,
+			commitLSN: 40,
+		}
+	}
+
+	t.Run("library does not acknowledge Begin", func(t *testing.T) {
+		s := NewStream("", config.Config{}, metric.NewMetric("test"), func(*ListenerContext) {}).(*stream)
+		s.messageCH <- begin()
+		close(s.messageCH)
+		require.NoError(t, s.processLoop(context.Background()))
+		assert.Equal(t, pq.LSN(0), s.LoadConfirmedXLogPos())
+	})
+
+	t.Run("Ack confirms the begin record, not FinalLSN", func(t *testing.T) {
+		s := NewStream("", config.Config{}, metric.NewMetric("test"), func(ctx *ListenerContext) {
+			require.NoError(t, ctx.Ack())
+		}).(*stream)
+		s.messageCH <- begin()
+		close(s.messageCH)
+		require.NoError(t, s.processLoop(context.Background()))
+		assert.Equal(t, pq.LSN(1), s.LoadConfirmedXLogPos())
+	})
 }
 
 func TestCloseCancelsBeforeClosingGuardAndAfterProcessExit(t *testing.T) {

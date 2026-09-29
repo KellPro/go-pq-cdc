@@ -139,8 +139,12 @@ func Handler(ctx *replication.ListenerContext) {
 		slog.Info("update message received", "new", msg.NewDecoded, "old", msg.OldDecoded)
 	case *format.Truncate:
 		slog.Info("truncate message received", "relations", msg.RelationOIDs, "cascade", msg.Cascade, "restartIdentity", msg.RestartIdentity)
-	case *format.Begin, *format.Commit, *format.StreamCommit:
+	case *format.Begin:
 		return
+	case *format.Commit, *format.StreamCommit:
+		// Acknowledge after the consumer's commit record is durable.
+		// walStart is the transaction-end LSN, so this moves the slot past the commit.
+		slog.Info("commit message received", "commitLSN", ctx.CommitLSN)
 	}
 
 	if err := ctx.Ack(); err != nil {
@@ -150,7 +154,7 @@ func Handler(ctx *replication.ListenerContext) {
 
 ```
 
-`Begin`, `Commit`, and `StreamCommit` are delivered to `Handler` when `boundaryMessages` is true. The default is false. When enabled, `Begin` arrives before that transaction's changes, and `Commit` and `StreamCommit` arrive after them. Leave these messages unacked. The slot advances when a row event is acked: the last change in the transaction is positioned at the transaction-end LSN, and that ack moves the slot past the commit. An ack of `Commit` or `StreamCommit` confirms only the start of the commit record and can mark the preceding row changes consumed. `StreamAbort` is not delivered. A rolled-back transaction never reaches the listener.
+`Begin`, `Commit`, and `StreamCommit` are delivered to `Handler` when `boundaryMessages` is true. The default is false. When enabled, `Begin` arrives before that transaction's changes, and `Commit` and `StreamCommit` arrive after them. Acknowledge each row at its own WAL position. Acknowledging `Begin` is optional. `Ack` confirms the begin record's own WAL position, not `Begin.FinalLSN`. That call changes nothing the following row acknowledgements and the `Commit` acknowledgement do not already cover. The library does not acknowledge `Begin`. Acknowledge `Commit` or `StreamCommit` only after the consumer's commit record is durable. That acknowledgement confirms the transaction-end LSN and moves the slot past the commit. An acknowledgement of `Commit` at the start of the commit record is too early and can mark the preceding rows consumed. `StreamAbort` is not delivered. A rolled-back transaction never reaches the listener.
 
 ### Examples
 
@@ -368,7 +372,7 @@ You can run [Replica Identity Nothing](./example/replica-identity-nothing) for a
 | `password`                              |  string  |   yes    |    -    | PostgreSQL password                                                                                   | Keep secure and avoid hardcoding in the source code.                                                                                               |
 | `database`                              |  string  |   yes    |    -    | PostgreSQL database                                                                                   | The database must exist and be accessible by the specified user.                                                                                   |
 | `debugMode`                             |   bool   |    no    |  false  | For debugging purposes                                                                                | Enables pprof for trace.                                                                                                                           |
-| `boundaryMessages`                      |   bool   |    no    |  false  | Deliver `Begin`, `Commit`, and `StreamCommit` to the handler                                          | Leave these messages unacked. Slot progress comes from acknowledging row events.                                                                  |
+| `boundaryMessages`                      |   bool   |    no    |  false  | Deliver `Begin`, `Commit`, and `StreamCommit` to the handler                                          | Acknowledging `Begin` is optional and confirms the begin record's own position, not `FinalLSN`. Acknowledge each row at its own position. Acknowledge `Commit` or `StreamCommit` at the transaction-end LSN only after the consumer's commit record is durable. |
 | `metric.port`                           |   int    |    no    |  8080   | Set API port                                                                                          | Choose a port that is not in use by other applications.                                                                                            |
 | `logger.logLevel`                       |  string  |    no    |  info   | Set logging level                                                                                     | [`DEBUG`, `WARN`, `INFO`, `ERROR`]                                                                                                                 |
 | `logger.logger`                         |  Logger  |    no    |  slog   | Set logger                                                                                            | Can be customized with other logging frameworks if `slog` is not used.                                                                             |

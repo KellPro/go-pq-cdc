@@ -203,10 +203,11 @@ func (s *stream) setup(ctx context.Context) error {
 
 // messageBuffer manages a one-message look-ahead buffer.
 //
-// The last DML message in each transaction is held back so its WAL position
-// can be rewritten to the transaction-end LSN (from COMMIT / STREAM COMMIT).
-// All preceding messages are emitted immediately with their original position.
-// This keeps memory usage O(1) regardless of transaction size.
+// The last DML message in each transaction is held back until COMMIT. When
+// BoundaryMessages is off, that message's WAL position is rewritten to the
+// transaction-end LSN. When it is on, the message keeps its own position and
+// Commit carries the transaction-end LSN. Preceding messages are emitted
+// immediately with their original position. Memory use stays O(1).
 type messageBuffer struct {
 	pending   *Message
 	outCh     chan<- *Message
@@ -237,20 +238,27 @@ func (b *messageBuffer) flush() {
 	}
 }
 
-// flushWithLSN emits the pending message (if any), rewriting its WAL position
-// to the given transaction-end LSN. Used at COMMIT.
-func (b *messageBuffer) flushWithLSN(lsn pq.LSN) {
-	if b.pending != nil {
-		if !b.send(&Message{
-			message:   b.pending.message,
-			walStart:  int64(lsn),
-			xid:       b.pending.xid,
-			commitLSN: b.pending.commitLSN,
-		}) {
-			return
-		}
-		b.pending = nil
+// flushWithLSN emits the pending message (if any). When rewrite is set, its
+// WAL position becomes the transaction-end LSN so acknowledging that message
+// moves the slot past the commit. When rewrite is false the message keeps its
+// own WAL position; the caller delivers Commit at the transaction-end LSN.
+func (b *messageBuffer) flushWithLSN(lsn pq.LSN, rewrite bool) {
+	if b.pending == nil {
+		return
 	}
+	if !rewrite {
+		b.flush()
+		return
+	}
+	if !b.send(&Message{
+		message:   b.pending.message,
+		walStart:  int64(lsn),
+		xid:       b.pending.xid,
+		commitLSN: b.pending.commitLSN,
+	}) {
+		return
+	}
+	b.pending = nil
 }
 
 // discard drops the pending message without emitting.
@@ -333,16 +341,18 @@ func (s *streamTxBuffer) stopTx() {
 }
 
 // flushTx emits every accumulated message for the given XID through outCh.
-// Every message is stamped with the commit LSN (known only at STREAM COMMIT);
-// the last message's WAL position is rewritten to the transaction-end LSN.
-func (s *streamTxBuffer) flushTx(xid uint32, outCh chan<- *Message, commitLSN, endLSN pq.LSN) {
+// Every message is stamped with the commit LSN (known only at STREAM COMMIT).
+// When rewriteLast is set, the last message's WAL position becomes the
+// transaction-end LSN. When it is false each message keeps its own position
+// and the caller delivers StreamCommit at the transaction-end LSN.
+func (s *streamTxBuffer) flushTx(xid uint32, outCh chan<- *Message, commitLSN, endLSN pq.LSN, rewriteLast bool) {
 	s.streaming = false
 	msgs := s.txns[xid]
 	n := len(msgs)
 	for i, msg := range msgs {
 		msg.commitLSN = commitLSN
 		out := msg
-		if i == n-1 {
+		if rewriteLast && i == n-1 {
 			out = &Message{
 				message:   msg.message,
 				walStart:  int64(endLSN),
@@ -569,8 +579,12 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 // This prevents uncommitted data from being delivered.
 //
 // Begin, Commit, and StreamCommit are delivered to the listener after that
-// bookkeeping, in stream order, when BoundaryMessages is set.
-// StreamAbort is not: a rolled-back transaction is never delivered.
+// bookkeeping, in stream order, when BoundaryMessages is set. Commit and
+// StreamCommit carry the transaction-end LSN so acknowledging them moves the
+// slot past the commit. The last change keeps its own WAL position on that
+// path. When BoundaryMessages is off, the last change is rewritten to the
+// transaction-end LSN instead, because the listener never sees Commit.
+// StreamAbort is not delivered. A rolled-back transaction never reaches the listener.
 func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffer, streamBuf *streamTxBuffer) {
 	switch msg := decodedMsg.(type) {
 	case *format.Begin:
@@ -578,6 +592,9 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 		buf.xid = msg.Xid
 		buf.commitLSN = msg.FinalLSN
 		if s.config.BoundaryMessages {
+			// Ack position is the begin record, not FinalLSN. FinalLSN is the
+			// start of the commit record; confirming it would skip the rows.
+			// The library does not acknowledge Begin. The listener may.
 			buf.send(&Message{
 				message:   decodedMsg,
 				walStart:  int64(xld.WALStart),
@@ -587,14 +604,14 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 		}
 
 	case *format.Commit:
-		buf.flushWithLSN(msg.TransactionEndLSN)
-		// Deliver Commit after the transaction's changes, with the xid and
-		// commit LSN recorded at Begin, so the listener sees the boundary
-		// when the transaction commits.
+		// Rewrite the last change only when Commit is not delivered. Otherwise
+		// that acknowledgement would confirm the transaction-end LSN before
+		// the consumer has persisted its own commit record.
+		buf.flushWithLSN(msg.TransactionEndLSN, !s.config.BoundaryMessages)
 		if s.config.BoundaryMessages {
 			buf.send(&Message{
 				message:   decodedMsg,
-				walStart:  int64(xld.WALStart),
+				walStart:  int64(msg.TransactionEndLSN),
 				xid:       buf.xid,
 				commitLSN: buf.commitLSN,
 			})
@@ -610,13 +627,14 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 		streamBuf.stopTx()
 
 	case *format.StreamCommit:
-		// Final commit of a streamed transaction – emit all messages for this XID,
-		// then the commit itself so the boundary is not deferred to the next transaction.
-		streamBuf.flushTx(msg.Xid, buf.outCh, msg.CommitLSN, msg.TransactionEndLSN)
+		// Final commit of a streamed transaction. Emit this XID's changes, then
+		// StreamCommit when BoundaryMessages is set, so the boundary is not
+		// deferred to the next transaction.
+		streamBuf.flushTx(msg.Xid, buf.outCh, msg.CommitLSN, msg.TransactionEndLSN, !s.config.BoundaryMessages)
 		if s.config.BoundaryMessages {
 			buf.send(&Message{
 				message:   decodedMsg,
-				walStart:  int64(xld.WALStart),
+				walStart:  int64(msg.TransactionEndLSN),
 				xid:       msg.Xid,
 				commitLSN: msg.CommitLSN,
 			})
