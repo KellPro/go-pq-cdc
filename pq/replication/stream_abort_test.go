@@ -139,17 +139,35 @@ func TestStreamAbortUnknownSubTransactionIsNoop(t *testing.T) {
 	assert.Equal(t, []string{"a"}, h.delivered())
 }
 
-func TestStreamAbortSubTransactionRewritesLastLSN(t *testing.T) {
-	// After truncation the surviving last message must carry the transaction-end LSN.
-	h := newStreamAbortHarness()
-	h.dispatch(&format.StreamStart{Xid: 100}, 1)
-	h.insert(100, "a", 10)
-	h.insert(101, "b", 11)
-	h.dispatch(&format.StreamStop{}, 12)
-	h.dispatch(&format.StreamAbort{Xid: 100, SubXid: 101}, 13)
-	h.dispatch(&format.StreamCommit{Xid: 100, TransactionEndLSN: 99}, 14)
+func TestStreamAbortSubTransactionLastLSN(t *testing.T) {
+	dispatch := func(boundaryMessages bool) *streamAbortHarness {
+		h := newStreamAbortHarness()
+		h.s.config.BoundaryMessages = boundaryMessages
+		h.dispatch(&format.StreamStart{Xid: 100}, 1)
+		h.insert(100, "a", 10)
+		h.insert(101, "b", 11)
+		h.dispatch(&format.StreamStop{}, 12)
+		h.dispatch(&format.StreamAbort{Xid: 100, SubXid: 101}, 13)
+		h.dispatch(&format.StreamCommit{Xid: 100, TransactionEndLSN: 99}, 14)
+		return h
+	}
 
-	m := <-h.out
-	assert.Equal(t, "a", m.message.(*format.Insert).TableName)
-	assert.Equal(t, int64(99), m.walStart)
+	t.Run("off rewrites the surviving row", func(t *testing.T) {
+		h := dispatch(false)
+		m := <-h.out
+		assert.Equal(t, "a", m.message.(*format.Insert).TableName)
+		assert.Equal(t, int64(99), m.walStart)
+		assert.Empty(t, h.delivered())
+	})
+
+	t.Run("on keeps the row position and confirms the end on StreamCommit", func(t *testing.T) {
+		h := dispatch(true)
+		row := <-h.out
+		assert.Equal(t, "a", row.message.(*format.Insert).TableName)
+		assert.Equal(t, int64(10), row.walStart)
+		commit := <-h.out
+		assert.IsType(t, &format.StreamCommit{}, commit.message)
+		assert.Equal(t, int64(99), commit.walStart)
+		assert.Empty(t, h.delivered())
+	})
 }

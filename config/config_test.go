@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq/slot"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v2"
 )
 
 func TestGetSnapshotTables(t *testing.T) {
@@ -748,4 +750,18 @@ func TestReadConfigYAMLStatusUpdateInterval(t *testing.T) {
 	cfg = read("0s")
 	require.NotNil(t, cfg.StatusUpdateInterval)
 	require.Zero(t, *cfg.StatusUpdateInterval)
+}
+
+func TestBoundaryMessagesDefaultsOff(t *testing.T) {
+	var fromYAML Config
+	require.NoError(t, yaml.Unmarshal([]byte("host: localhost\nboundaryMessages: true\n"), &fromYAML))
+	assert.True(t, fromYAML.BoundaryMessages)
+
+	var omitted Config
+	require.NoError(t, yaml.Unmarshal([]byte("host: localhost\n"), &omitted))
+	assert.False(t, omitted.BoundaryMessages)
+
+	var fromJSON Config
+	require.NoError(t, json.Unmarshal([]byte(`{"boundaryMessages":true}`), &fromJSON))
+	assert.True(t, fromJSON.BoundaryMessages)
 }

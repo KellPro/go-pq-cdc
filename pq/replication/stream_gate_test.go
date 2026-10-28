@@ -2,18 +2,19 @@ package replication
 
 import (
 	"context"
-	"log/slog"
-	"sync"
-	"testing"
-	"time"
-
+	"fmt"
 	"github.com/Trendyol/go-pq-cdc/config"
+	"github.com/Trendyol/go-pq-cdc/internal/metric"
 	"github.com/Trendyol/go-pq-cdc/logger"
 	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"log/slog"
+	"sync"
+	"testing"
+	"time"
 )
 
 // gatedStream wires a stream to a scripted guard and records what the listener saw.
@@ -156,38 +157,95 @@ func TestGateDisabledDoesNotTouchGuard(t *testing.T) {
 }
 
 func TestDispatchStampsXidAndCommitLSNOnNonStreamingAndStreamingPaths(t *testing.T) {
-	out := make(chan *Message, 10)
-	s := &stream{}
-	buf := &messageBuffer{outCh: out}
-	streamBuf := &streamTxBuffer{}
-	dispatch := func(msg any, lsn uint64) { s.dispatchMessage(msg, XLogData{WALStart: pq.LSN(lsn)}, buf, streamBuf) }
-
-	// Non-streaming: BEGIN(100, final 40) a b COMMIT → both carry xid 100 and commit 40 (from Begin.FinalLSN);
-	// the last one is rebuilt by flushWithLSN.
-	dispatch(&format.Begin{Xid: 100, FinalLSN: 40}, 1)
-	dispatch(&format.Insert{TableName: "a"}, 2)
-	dispatch(&format.Insert{TableName: "b"}, 3)
-	dispatch(&format.Commit{CommitLSN: 40, TransactionEndLSN: 50}, 4)
-	// Streaming: STREAM START(200) c(sub 201) d STREAM STOP STREAM COMMIT(commit 90, end 99) → both carry the
-	// top-level 200 and commit 90, which is only known at STREAM COMMIT.
-	dispatch(&format.StreamStart{Xid: 200}, 5)
-	dispatch(&format.Insert{XID: 201, TableName: "c"}, 6)
-	dispatch(&format.Insert{XID: 200, TableName: "d"}, 7)
-	dispatch(&format.StreamStop{}, 8)
-	dispatch(&format.StreamCommit{Xid: 200, CommitLSN: 90, TransactionEndLSN: 99}, 9)
-	close(out)
-
 	type stamped struct {
+		kind   string
 		name   string
 		xid    uint32
 		lsn    int64
 		commit pq.LSN
 	}
-	var got []stamped
-	for m := range out {
-		got = append(got, stamped{m.message.(*format.Insert).TableName, m.xid, m.walStart, m.commitLSN})
+	dispatch := func(cfg config.Config) []stamped {
+		out := make(chan *Message, 10)
+		s := &stream{config: cfg}
+		buf := &messageBuffer{outCh: out}
+		streamBuf := &streamTxBuffer{}
+		send := func(msg any, lsn uint64) { s.dispatchMessage(msg, XLogData{WALStart: pq.LSN(lsn)}, buf, streamBuf) }
+
+		// Non-streaming: BEGIN(100, final 40) a b COMMIT → both carry xid 100 and commit 40 (from Begin.FinalLSN).
+		send(&format.Begin{Xid: 100, FinalLSN: 40}, 1)
+		send(&format.Insert{TableName: "a"}, 2)
+		send(&format.Insert{TableName: "b"}, 3)
+		send(&format.Commit{CommitLSN: 40, TransactionEndLSN: 50}, 4)
+		// Streaming: STREAM START(200) c(sub 201) d STREAM STOP STREAM COMMIT(commit 90, end 99) → both carry the
+		// top-level 200 and commit 90, which is only known at STREAM COMMIT.
+		send(&format.StreamStart{Xid: 200}, 5)
+		send(&format.Insert{XID: 201, TableName: "c"}, 6)
+		send(&format.Insert{XID: 200, TableName: "d"}, 7)
+		send(&format.StreamStop{}, 8)
+		send(&format.StreamCommit{Xid: 200, CommitLSN: 90, TransactionEndLSN: 99}, 9)
+		close(out)
+
+		var got []stamped
+		for m := range out {
+			kind := fmt.Sprintf("%T", m.message)
+			name := ""
+			if insert, ok := m.message.(*format.Insert); ok {
+				name = insert.TableName
+			}
+			got = append(got, stamped{kind, name, m.xid, m.walStart, m.commitLSN})
+		}
+		return got
 	}
-	assert.Equal(t, []stamped{{"a", 100, 2, 40}, {"b", 100, 50, 40}, {"c", 200, 6, 90}, {"d", 200, 99, 90}}, got)
+
+	// Flag off: the last change is rewritten to the transaction-end LSN, and the boundaries stay internal.
+	assert.Equal(t, []stamped{
+		{"*format.Insert", "a", 100, 2, 40},
+		{"*format.Insert", "b", 100, 50, 40},
+		{"*format.Insert", "c", 200, 6, 90},
+		{"*format.Insert", "d", 200, 99, 90},
+	}, dispatch(config.Config{}))
+	// Flag on: each row keeps its own WAL position. Begin keeps its own WAL
+	// position (1), not FinalLSN (40). Commit and StreamCommit carry the
+	// transaction-end LSN.
+	assert.Equal(t, []stamped{
+		{"*format.Begin", "", 100, 1, 40},
+		{"*format.Insert", "a", 100, 2, 40},
+		{"*format.Insert", "b", 100, 3, 40},
+		{"*format.Commit", "", 100, 50, 40},
+		{"*format.Insert", "c", 200, 6, 90},
+		{"*format.Insert", "d", 200, 7, 90},
+		{"*format.StreamCommit", "", 200, 99, 90},
+	}, dispatch(config.Config{BoundaryMessages: true}))
+}
+
+func TestBeginAckIsOptionalAndConfirmsOwnPosition(t *testing.T) {
+	logger.InitLogger(logger.NewSlog(slog.LevelError))
+	begin := func() *Message {
+		return &Message{
+			message:   &format.Begin{Xid: 100, FinalLSN: 40},
+			walStart:  1,
+			xid:       100,
+			commitLSN: 40,
+		}
+	}
+
+	t.Run("library does not acknowledge Begin", func(t *testing.T) {
+		s := NewStream("", config.Config{}, metric.NewMetric("test"), func(*ListenerContext) {}).(*stream)
+		s.messageCH <- begin()
+		close(s.messageCH)
+		require.NoError(t, s.processLoop(context.Background()))
+		assert.Equal(t, pq.LSN(0), s.LoadConfirmedXLogPos())
+	})
+
+	t.Run("Ack confirms the begin record, not FinalLSN", func(t *testing.T) {
+		s := NewStream("", config.Config{}, metric.NewMetric("test"), func(ctx *ListenerContext) {
+			require.NoError(t, ctx.Ack())
+		}).(*stream)
+		s.messageCH <- begin()
+		close(s.messageCH)
+		require.NoError(t, s.processLoop(context.Background()))
+		assert.Equal(t, pq.LSN(1), s.LoadConfirmedXLogPos())
+	})
 }
 
 func TestCloseCancelsBeforeClosingGuardAndAfterProcessExit(t *testing.T) {
